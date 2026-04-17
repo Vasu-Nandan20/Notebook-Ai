@@ -19,7 +19,7 @@ interface ChatContextType {
   clearAllChats: () => void
   deleteOlderThan: (days: number) => void
   renameChat: (id: string, title: string) => void
-  addMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => void
+  addMessage: (message: Omit<ChatMessage, 'id' | 'timestamp'>) => string | undefined
   updateMessage: (id: string, content: string) => void
   deleteMessage: (id: string) => void
   addReaction: (messageId: string, reaction: string) => void
@@ -225,39 +225,49 @@ export function ChatProvider({ children }: { children: ReactNode }) {
   }, [currentChat])
 
   const addMessage = useCallback(
-    (message: Omit<ChatMessage, 'id' | 'timestamp'>) => {
-      if (!currentChat) return
+    (message: Omit<ChatMessage, 'id' | 'timestamp'>): string | undefined => {
+      const chatId = currentChat?.id
+      if (!chatId) return undefined
+
+      const newId = `${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
       const newMessage: ChatMessage = {
         ...message,
-        id: Date.now().toString(),
+        id: newId,
         timestamp: new Date(),
         reactions: [],
       }
-      const updatedChat = {
-        ...currentChat,
-        messages: [...currentChat.messages, newMessage],
+
+      const applyToChat = (chat: Chat): Chat => ({
+        ...chat,
+        messages: [...chat.messages, newMessage],
         updatedAt: new Date(),
         title:
-          currentChat.messages.length === 0 && message.role === 'user'
+          chat.messages.length === 0 && message.role === 'user'
             ? message.content.slice(0, 50)
-            : currentChat.title,
-      }
-      setCurrentChat(updatedChat)
-      setChatsState((prev) => prev.map((c) => (c.id === currentChat.id ? updatedChat : c)))
+            : chat.title,
+      })
+
+      setCurrentChat((prev) => (prev && prev.id === chatId ? applyToChat(prev) : prev))
+      setChatsState((prev) => prev.map((c) => (c.id === chatId ? applyToChat(c) : c)))
+
+      return newId
     },
     [currentChat]
   )
 
   const updateMessage = useCallback(
     (id: string, content: string) => {
-      if (!currentChat) return
-      const updatedChat = {
-        ...currentChat,
-        messages: currentChat.messages.map((m) => (m.id === id ? { ...m, content } : m)),
+      const chatId = currentChat?.id
+      if (!chatId) return
+
+      const applyToChat = (chat: Chat): Chat => ({
+        ...chat,
+        messages: chat.messages.map((m) => (m.id === id ? { ...m, content } : m)),
         updatedAt: new Date(),
-      }
-      setCurrentChat(updatedChat)
-      setChatsState((prev) => prev.map((c) => (c.id === currentChat.id ? updatedChat : c)))
+      })
+
+      setCurrentChat((prev) => (prev && prev.id === chatId ? applyToChat(prev) : prev))
+      setChatsState((prev) => prev.map((c) => (c.id === chatId ? applyToChat(c) : c)))
     },
     [currentChat]
   )
