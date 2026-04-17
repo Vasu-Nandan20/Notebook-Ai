@@ -1,0 +1,273 @@
+{
+  "name": "03 — Flashcard Generation Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "generate-flashcards",
+        "options": {
+          "responseMode": "responseNode"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 400],
+      "id": "wh-flashcards",
+      "name": "Webhook: Generate Flashcards"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate flashcard generation request\nconst body = $input.first().json.body;\n\nif (!body.user_id || !body.file_id) {\n  throw new Error('Missing required fields: user_id, file_id');\n}\n\nreturn [{\n  json: {\n    user_id: body.user_id,\n    file_id: body.file_id,\n    num_cards: body.num_cards || 10,\n    focus_topics: body.focus_topics || [],\n    use_tfidf: body.use_tfidf !== false  // default true\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 400],
+      "id": "validate-fc-req",
+      "name": "Validate: FC Request"
+    },
+    {
+      "parameters": {
+        "method": "GET",
+        "url": "=YOUR_SUPABASE_URL/rest/v1/documents?user_id=eq.{{ $json.user_id }}&file_id=eq.{{ $json.file_id }}&select=content,chunk_index,file_name&order=chunk_index.asc",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "options": {}
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 400],
+      "id": "fetch-file-chunks",
+      "name": "Fetch: File Chunks",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// TF-IDF Topic Extraction + Prepare LLM prompt\nconst chunks = $input.first().json;\nconst params = $('Validate: FC Request').first().json;\n\n// Gather all chunks (could be array at top level)\nconst allChunks = Array.isArray(chunks) ? chunks : [chunks];\n\nif (allChunks.length === 0 || !allChunks[0].content) {\n  throw new Error('No content found for the specified file. Please process the file first.');\n}\n\nconst fullText = allChunks.map(c => c.content).join(' ');\nconst fileName = allChunks[0].file_name || 'Unknown File';\n\n// =====================================\n// TF-IDF Topic Extraction (Lightweight)\n// =====================================\n\n// Tokenize and clean\nconst stopWords = new Set([\n  'the','a','an','is','are','was','were','be','been','being','have','has','had',\n  'do','does','did','will','would','shall','should','may','might','can','could',\n  'in','on','at','to','for','of','with','by','from','as','into','through',\n  'and','but','or','nor','not','so','yet','both','either','neither',\n  'this','that','these','those','it','its','he','she','they','we','you',\n  'his','her','their','our','your','my','me','him','them','us',\n  'what','which','who','whom','where','when','why','how',\n  'all','each','every','any','some','no','more','most','other','such',\n  'than','too','very','just','about','above','after','before','between',\n  'also','only','then','there','here','now','up','out','if','because'\n]);\n\nconst words = fullText.toLowerCase()\n  .replace(/[^a-z0-9\\s]/g, ' ')\n  .split(/\\s+/)\n  .filter(w => w.length > 3 && !stopWords.has(w) && !/^\\d+$/.test(w));\n\n// Calculate Term Frequency\nconst tf = {};\nfor (const word of words) {\n  tf[word] = (tf[word] || 0) + 1;\n}\n\n// Calculate IDF across chunks (each chunk = a document)\nconst idf = {};\nconst chunkTexts = allChunks.map(c => c.content.toLowerCase());\nconst totalDocs = chunkTexts.length;\n\nfor (const word of Object.keys(tf)) {\n  const docsContaining = chunkTexts.filter(t => t.includes(word)).length;\n  idf[word] = Math.log(totalDocs / (docsContaining + 1)) + 1;\n}\n\n// Calculate TF-IDF scores\nconst tfidf = {};\nfor (const word of Object.keys(tf)) {\n  tfidf[word] = (tf[word] / words.length) * idf[word];\n}\n\n// Get top topics (bi-gram and single word)\nconst topTerms = Object.entries(tfidf)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 30)\n  .map(([term, score]) => term);\n\n// Extract bigrams for better topic detection\nconst bigrams = {};\nfor (let i = 0; i < words.length - 1; i++) {\n  const bigram = `${words[i]} ${words[i+1]}`;\n  if (!stopWords.has(words[i]) && !stopWords.has(words[i+1])) {\n    bigrams[bigram] = (bigrams[bigram] || 0) + 1;\n  }\n}\n\nconst topBigrams = Object.entries(bigrams)\n  .filter(([_, count]) => count >= 2)\n  .sort((a, b) => b[1] - a[1])\n  .slice(0, 15)\n  .map(([term]) => term);\n\nconst extractedTopics = [...topBigrams, ...topTerms].slice(0, 20);\n\n// =====================================\n// Build Flashcard Generation Prompt\n// =====================================\n\n// Use first ~6000 chars of text as context (Groq token limits)\nconst contextText = fullText.substring(0, 6000);\n\nconst focusSection = params.focus_topics.length > 0\n  ? `\\nFOCUS ON THESE TOPICS: ${params.focus_topics.join(', ')}`\n  : '';\n\nconst prompt = `You are an expert educator creating study flashcards. Generate high-quality Q&A flashcard pairs from the following study material.\n\nSTUDY MATERIAL (from \"${fileName}\"):\n${contextText}\n\nKEY TOPICS IDENTIFIED (via TF-IDF analysis):\n${extractedTopics.join(', ')}\n${focusSection}\n\nGENERATE ${params.num_cards} flashcards. Each flashcard should:\n1. Cover a distinct concept, definition, process, or relationship\n2. Have a clear, specific question (not too vague)\n3. Have a concise but complete answer (2-4 sentences)\n4. Be tagged with the relevant topic\n5. Include difficulty rating\n\nRespond ONLY with valid JSON in this exact format:\n{\n  \"flashcards\": [\n    {\n      \"id\": 1,\n      \"question\": \"Clear, specific question?\",\n      \"answer\": \"Concise, accurate answer with key details.\",\n      \"topic\": \"Topic/concept category\",\n      \"difficulty\": \"easy|medium|hard\",\n      \"key_terms\": [\"important\", \"terms\", \"in\", \"this\", \"card\"]\n    }\n  ],\n  \"source_topics\": [\"list of main topics covered\"]\n}`;\n\nreturn [{\n  json: {\n    ...params,\n    file_name: fileName,\n    extracted_topics: extractedTopics,\n    tfidf_top_terms: topTerms.slice(0, 10),\n    total_chunks: allChunks.length,\n    llm_prompt: prompt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 400],
+      "id": "tfidf-extract",
+      "name": "Extract: TF-IDF Topics"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are an expert flashcard creator. Create high-quality study flashcards. Respond only with valid JSON.' }, { role: 'user', content: $json.llm_prompt }], temperature: 0.7, max_tokens: 4000, response_format: { type: 'json_object' } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 400],
+      "id": "groq-flashcards",
+      "name": "Groq: Generate Flashcards",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_GROQ_CREDENTIAL_ID",
+          "name": "Groq API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse flashcards from Groq response\nconst groqResponse = $input.first().json;\nconst params = $('Extract: TF-IDF Topics').first().json;\n\nlet flashcardData;\ntry {\n  const content = groqResponse.choices[0].message.content;\n  flashcardData = JSON.parse(content);\n} catch (e) {\n  throw new Error('Failed to parse flashcards from LLM: ' + e.message);\n}\n\nconst flashcards = flashcardData.flashcards || [];\n\n// Return individual items for batch storage\nconst items = flashcards.map((card, idx) => ({\n  json: {\n    user_id: params.user_id,\n    file_id: params.file_id,\n    question: card.question,\n    answer: card.answer,\n    topic: card.topic || 'General',\n    difficulty: card.difficulty || 'medium',\n    metadata: {\n      key_terms: card.key_terms || [],\n      card_index: idx,\n      file_name: params.file_name,\n      source_topics: flashcardData.source_topics || [],\n      tfidf_topics: params.tfidf_top_terms\n    }\n  }\n}));\n\nreturn items;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 400],
+      "id": "parse-flashcards",
+      "name": "Parse: Flashcards"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=YOUR_SUPABASE_URL/rest/v1/flashcards",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ user_id: $json.user_id, file_id: $json.file_id, question: $json.question, answer: $json.answer, topic: $json.topic, difficulty: $json.difficulty, metadata: $json.metadata }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 400],
+      "id": "store-flashcards",
+      "name": "Store: Flashcards",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build final response with all flashcards\nconst storedCards = $input.all();\nconst params = $('Extract: TF-IDF Topics').first().json;\n\n// Reconstruct flashcard list from stored responses\nconst flashcards = storedCards.map(item => {\n  const data = Array.isArray(item.json) ? item.json[0] : item.json;\n  return {\n    id: data.id,\n    question: data.question,\n    answer: data.answer,\n    topic: data.topic,\n    difficulty: data.difficulty\n  };\n});\n\nreturn [{\n  json: {\n    success: true,\n    file_id: params.file_id,\n    file_name: params.file_name,\n    total_flashcards: flashcards.length,\n    extracted_topics: params.extracted_topics,\n    tfidf_key_terms: params.tfidf_top_terms,\n    flashcards: flashcards,\n    generated_at: new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1740, 400],
+      "id": "build-fc-response",
+      "name": "Build: FC Response"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1960, 400],
+      "id": "respond-flashcards",
+      "name": "Respond: Flashcards"
+    }
+  ],
+  "connections": {
+    "Webhook: Generate Flashcards": {
+      "main": [
+        [
+          {
+            "node": "Validate: FC Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate: FC Request": {
+      "main": [
+        [
+          {
+            "node": "Fetch: File Chunks",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch: File Chunks": {
+      "main": [
+        [
+          {
+            "node": "Extract: TF-IDF Topics",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract: TF-IDF Topics": {
+      "main": [
+        [
+          {
+            "node": "Groq: Generate Flashcards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: Generate Flashcards": {
+      "main": [
+        [
+          {
+            "node": "Parse: Flashcards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse: Flashcards": {
+      "main": [
+        [
+          {
+            "node": "Store: Flashcards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store: Flashcards": {
+      "main": [
+        [
+          {
+            "node": "Build: FC Response",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build: FC Response": {
+      "main": [
+        [
+          {
+            "node": "Respond: Flashcards",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "study-app-flashcards"
+  }
+}

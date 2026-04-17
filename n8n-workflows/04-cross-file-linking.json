@@ -1,0 +1,315 @@
+{
+  "name": "04 — Cross-File Linking Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "cross-link",
+        "options": {
+          "responseMode": "responseNode"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 400],
+      "id": "wh-crosslink",
+      "name": "Webhook: Cross-Link"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate cross-file linking request\nconst body = $input.first().json.body;\n\nif (!body.user_id || !body.query) {\n  throw new Error('Missing required fields: user_id, query');\n}\n\nreturn [{\n  json: {\n    user_id: body.user_id,\n    query: body.query,\n    max_results: body.max_results || 20,\n    similarity_threshold: body.similarity_threshold || 0.3\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 400],
+      "id": "validate-crosslink",
+      "name": "Validate: Request"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ inputs: $json.query, options: { wait_for_model: true } }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [640, 400],
+      "id": "embed-crosslink-query",
+      "name": "Embed: Query (HF)",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_HF_CREDENTIAL_ID",
+          "name": "HuggingFace API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare query embedding for cross-file search\nconst embeddingRaw = $input.first().json.data || $input.first().json;\nconst params = $('Validate: Request').first().json;\n\nlet embedding;\nif (Array.isArray(embeddingRaw) && Array.isArray(embeddingRaw[0])) {\n  embedding = embeddingRaw[0];\n} else if (Array.isArray(embeddingRaw)) {\n  embedding = embeddingRaw;\n}\n\nreturn [{\n  json: {\n    ...params,\n    query_embedding: embedding\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [860, 400],
+      "id": "prepare-crosslink-search",
+      "name": "Prepare: Embedding"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=YOUR_SUPABASE_URL/rest/v1/rpc/cross_file_search",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query_embedding: '[' + $json.query_embedding.join(',') + ']', p_user_id: $json.user_id, match_threshold: $json.similarity_threshold, match_count: $json.max_results }) }}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 400],
+      "id": "crossfile-search",
+      "name": "Search: All Files",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Group results by file and identify common entities\nconst searchResults = $input.first().json;\nconst params = $('Validate: Request').first().json;\n\nconst results = Array.isArray(searchResults) ? searchResults :\n                (searchResults.data ? searchResults.data : [searchResults]);\n\nif (results.length === 0) {\n  return [{\n    json: {\n      skip_llm: true,\n      response: {\n        success: true,\n        query: params.query,\n        message: 'No relevant content found across your files.',\n        file_groups: [],\n        common_entities: [],\n        connections: []\n      }\n    }\n  }];\n}\n\n// Group results by file\nconst fileGroups = {};\nfor (const r of results) {\n  const fid = r.file_id || 'unknown';\n  if (!fileGroups[fid]) {\n    fileGroups[fid] = {\n      file_id: fid,\n      file_name: r.file_name || 'Unknown',\n      chunks: [],\n      avg_similarity: 0\n    };\n  }\n  fileGroups[fid].chunks.push({\n    content: r.content,\n    similarity: r.similarity\n  });\n}\n\n// Calculate avg similarity per file\nfor (const fid of Object.keys(fileGroups)) {\n  const group = fileGroups[fid];\n  group.avg_similarity = group.chunks.reduce((s, c) => s + c.similarity, 0) / group.chunks.length;\n  group.avg_similarity = Math.round(group.avg_similarity * 1000) / 1000;\n}\n\n// Basic entity extraction across all results\n// (Lightweight NER using pattern matching — proper NER would use an LLM)\nconst allText = results.map(r => r.content).join(' ');\n\n// Extract capitalized multi-word terms (potential named entities)\nconst entityPattern = /(?:[A-Z][a-z]+(?:\\s[A-Z][a-z]+)+)/g;\nconst rawEntities = allText.match(entityPattern) || [];\nconst entityCounts = {};\nfor (const e of rawEntities) {\n  const normalized = e.trim();\n  if (normalized.length > 3) {\n    entityCounts[normalized] = (entityCounts[normalized] || 0) + 1;\n  }\n}\n\n// Find entities that appear across multiple files\nconst crossFileEntities = [];\nfor (const [entity, count] of Object.entries(entityCounts)) {\n  if (count >= 2) {\n    const filesContaining = Object.entries(fileGroups)\n      .filter(([_, g]) => g.chunks.some(c => c.content.includes(entity)))\n      .map(([fid, g]) => g.file_name);\n    \n    if (filesContaining.length > 1) {\n      crossFileEntities.push({\n        entity: entity,\n        mention_count: count,\n        found_in_files: filesContaining\n      });\n    }\n  }\n}\n\ncrossFileEntities.sort((a, b) => b.found_in_files.length - a.found_in_files.length);\n\n// Build context for LLM analysis\nconst fileContexts = Object.values(fileGroups)\n  .sort((a, b) => b.avg_similarity - a.avg_similarity)\n  .map(g => {\n    const topChunks = g.chunks\n      .sort((a, b) => b.similarity - a.similarity)\n      .slice(0, 3)\n      .map(c => c.content)\n      .join('\\n');\n    return `[File: ${g.file_name} | Relevance: ${g.avg_similarity}]\\n${topChunks}`;\n  })\n  .join('\\n\\n===\\n\\n');\n\nconst filesInvolved = Object.values(fileGroups).map(g => g.file_name);\n\nconst prompt = `You are a knowledge synthesis expert. Analyze the following content retrieved from MULTIPLE study files in response to a user query.\n\nUSER QUERY: \"${params.query}\"\n\nFILES INVOLVED: ${filesInvolved.join(', ')}\n\nCROSS-FILE ENTITIES DETECTED: ${crossFileEntities.map(e => e.entity).join(', ') || 'None detected automatically'}\n\nCONTENT FROM EACH FILE:\n${fileContexts}\n\nPerform the following analysis and respond with JSON:\n\n1. **Connections**: Identify how information across different files relates to the query and to each other\n2. **Common Concepts**: Find shared themes, terminology, or concepts across files\n3. **Complementary Info**: Identify where one file fills knowledge gaps left by another\n4. **Synthesis**: Create a unified understanding combining insights from all files\n5. **Contradictions**: Note any conflicting information between files\n\nJSON format:\n{\n  \"synthesis\": \"A comprehensive 3-5 sentence answer to the query combining info from all files\",\n  \"connections\": [\n    {\n      \"file_a\": \"filename\",\n      \"file_b\": \"filename\",\n      \"relationship\": \"How these files relate on this topic\",\n      \"connection_type\": \"complementary|overlapping|contradictory|sequential\"\n    }\n  ],\n  \"common_concepts\": [\n    {\n      \"concept\": \"Shared concept name\",\n      \"files\": [\"file1\", \"file2\"],\n      \"description\": \"How this concept appears across files\"\n    }\n  ],\n  \"complementary_insights\": [\n    {\n      \"gap_in\": \"filename with gap\",\n      \"filled_by\": \"filename that fills it\",\n      \"insight\": \"What additional information is provided\"\n    }\n  ],\n  \"contradictions\": [],\n  \"study_recommendation\": \"Recommended order or approach to study these materials together\"\n}`;\n\nreturn [{\n  json: {\n    ...params,\n    skip_llm: false,\n    file_groups: Object.values(fileGroups),\n    cross_file_entities: crossFileEntities.slice(0, 15),\n    files_found: filesInvolved.length,\n    total_chunks: results.length,\n    llm_prompt: prompt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 400],
+      "id": "entity-analysis",
+      "name": "Analyze: Entities & Group"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.skip_llm }}",
+              "rightValue": false,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [1520, 400],
+      "id": "check-has-results",
+      "name": "IF: Has Results?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are a knowledge synthesis expert. Analyze cross-file relationships and provide insights. Respond only with valid JSON.' }, { role: 'user', content: $json.llm_prompt }], temperature: 0.5, max_tokens: 3000, response_format: { type: 'json_object' } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 340],
+      "id": "groq-crosslink",
+      "name": "Groq: Cross-File Analysis",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_GROQ_CREDENTIAL_ID",
+          "name": "Groq API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Format final cross-file linking response\nconst groqResponse = $input.first().json;\nconst analysisData = $('Analyze: Entities & Group').first().json;\n\nlet llmAnalysis;\ntry {\n  const content = groqResponse.choices[0].message.content;\n  llmAnalysis = JSON.parse(content);\n} catch (e) {\n  llmAnalysis = {\n    synthesis: 'Cross-file analysis could not be fully parsed.',\n    connections: [],\n    common_concepts: [],\n    complementary_insights: [],\n    contradictions: [],\n    study_recommendation: 'Review files individually and note common themes.'\n  };\n}\n\nreturn [{\n  json: {\n    success: true,\n    query: analysisData.query,\n    files_analyzed: analysisData.files_found,\n    total_chunks_matched: analysisData.total_chunks,\n    \n    // LLM-powered analysis\n    synthesis: llmAnalysis.synthesis,\n    connections: llmAnalysis.connections || [],\n    common_concepts: llmAnalysis.common_concepts || [],\n    complementary_insights: llmAnalysis.complementary_insights || [],\n    contradictions: llmAnalysis.contradictions || [],\n    study_recommendation: llmAnalysis.study_recommendation || '',\n    \n    // Pattern-based entity detection\n    cross_file_entities: analysisData.cross_file_entities,\n    \n    // File-level summaries\n    file_groups: analysisData.file_groups.map(g => ({\n      file_id: g.file_id,\n      file_name: g.file_name,\n      relevance: g.avg_similarity,\n      chunks_matched: g.chunks.length\n    })),\n    \n    analyzed_at: new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1960, 340],
+      "id": "format-crosslink",
+      "name": "Format: Cross-Link Result"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2180, 340],
+      "id": "respond-crosslink",
+      "name": "Respond: Cross-Link"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json.response) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1740, 500],
+      "id": "respond-no-results",
+      "name": "Respond: No Results"
+    }
+  ],
+  "connections": {
+    "Webhook: Cross-Link": {
+      "main": [
+        [
+          {
+            "node": "Validate: Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate: Request": {
+      "main": [
+        [
+          {
+            "node": "Embed: Query (HF)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed: Query (HF)": {
+      "main": [
+        [
+          {
+            "node": "Prepare: Embedding",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare: Embedding": {
+      "main": [
+        [
+          {
+            "node": "Search: All Files",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search: All Files": {
+      "main": [
+        [
+          {
+            "node": "Analyze: Entities & Group",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Analyze: Entities & Group": {
+      "main": [
+        [
+          {
+            "node": "IF: Has Results?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Has Results?": {
+      "main": [
+        [
+          {
+            "node": "Groq: Cross-File Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Respond: No Results",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: Cross-File Analysis": {
+      "main": [
+        [
+          {
+            "node": "Format: Cross-Link Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format: Cross-Link Result": {
+      "main": [
+        [
+          {
+            "node": "Respond: Cross-Link",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "study-app-cross-file-linking"
+  }
+}

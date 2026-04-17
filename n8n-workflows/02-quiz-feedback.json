@@ -1,0 +1,544 @@
+{
+  "name": "02 — Quiz & Feedback Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "generate-quiz",
+        "options": {
+          "responseMode": "responseNode"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 300],
+      "id": "wh-generate-quiz",
+      "name": "Webhook: Generate Quiz"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate quiz generation request\nconst body = $input.first().json.body;\n\nif (!body.user_id) {\n  throw new Error('Missing required field: user_id');\n}\n\nreturn [{\n  json: {\n    user_id: body.user_id,\n    file_id: body.file_id || null,\n    difficulty: body.difficulty || 'medium',\n    num_questions: body.num_questions || 5,\n    topic_focus: body.topic_focus || ''\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 300],
+      "id": "validate-quiz-req",
+      "name": "Validate: Quiz Request"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build a summary query for context retrieval\nconst item = $input.first().json;\n\nlet queryText = 'Key concepts and important information';\nif (item.topic_focus) {\n  queryText = item.topic_focus;\n}\n\n// We need to embed this query to search Supabase\nreturn [{\n  json: {\n    ...item,\n    query_text: queryText\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 300],
+      "id": "build-query",
+      "name": "Build: Search Query"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ inputs: $json.query_text, options: { wait_for_model: true } }) }}",
+        "options": {
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [860, 300],
+      "id": "embed-query",
+      "name": "Embed: Query (HF)",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_HF_CREDENTIAL_ID",
+          "name": "HuggingFace API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare vector search RPC call for Supabase\nconst embeddingRaw = $input.first().json.data || $input.first().json;\nconst prevData = $('Build: Search Query').first().json;\n\nlet embedding;\nif (Array.isArray(embeddingRaw) && Array.isArray(embeddingRaw[0])) {\n  embedding = embeddingRaw[0];\n} else if (Array.isArray(embeddingRaw)) {\n  embedding = embeddingRaw;\n}\n\nreturn [{\n  json: {\n    ...prevData,\n    query_embedding: embedding\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 300],
+      "id": "prepare-search",
+      "name": "Prepare: Vector Search"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=YOUR_SUPABASE_URL/rest/v1/rpc/match_documents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ query_embedding: '[' + $json.query_embedding.join(',') + ']', match_threshold: 0.3, match_count: 15, filter_user_id: $json.user_id, filter_file_id: $json.file_id || null }) }}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1300, 300],
+      "id": "search-supabase",
+      "name": "Search: Supabase Vectors",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Assemble context from search results and build LLM prompt\nconst searchResults = $input.first().json;\nconst quizParams = $('Validate: Quiz Request').first().json;\n\n// searchResults might be an array at top level\nconst results = Array.isArray(searchResults) ? searchResults : \n                (searchResults.data ? searchResults.data : [searchResults]);\n\n// Build context from retrieved chunks\nconst context = results\n  .map((r, i) => `[Chunk ${i+1} — ${r.file_name || 'Unknown'}]\\n${r.content}`)\n  .join('\\n\\n---\\n\\n');\n\nif (context.length < 50) {\n  throw new Error('No relevant content found for quiz generation. Please upload study materials first.');\n}\n\nconst difficultyGuide = {\n  easy: 'Basic recall and comprehension questions. Use simple language. Focus on definitions and key facts.',\n  medium: 'Application and analysis questions. Test understanding of concepts and relationships between ideas.',\n  hard: 'Synthesis and evaluation questions. Require deep understanding, critical thinking, and ability to connect multiple concepts.'\n};\n\nconst prompt = `You are an expert educator creating a quiz based on the following study material.\n\nSTUDY MATERIAL:\n${context}\n\nDIFFICULTY: ${quizParams.difficulty}\nGUIDELINES: ${difficultyGuide[quizParams.difficulty] || difficultyGuide.medium}\nNUMBER OF QUESTIONS: ${quizParams.num_questions}\n${quizParams.topic_focus ? 'FOCUS TOPIC: ' + quizParams.topic_focus : ''}\n\nGenerate exactly ${quizParams.num_questions} multiple-choice questions. Each question should have 4 options (A, B, C, D) with exactly one correct answer.\n\nRespond ONLY with valid JSON in this exact format:\n{\n  \"questions\": [\n    {\n      \"id\": 1,\n      \"question\": \"...\",\n      \"options\": {\n        \"A\": \"...\",\n        \"B\": \"...\",\n        \"C\": \"...\",\n        \"D\": \"...\"\n      },\n      \"correct_answer\": \"A\",\n      \"explanation\": \"Brief explanation of why this is correct\",\n      \"topic\": \"The topic this question covers\",\n      \"difficulty\": \"${quizParams.difficulty}\"\n    }\n  ]\n}`;\n\nreturn [{\n  json: {\n    ...quizParams,\n    context_length: context.length,\n    chunks_used: results.length,\n    llm_prompt: prompt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1520, 300],
+      "id": "build-quiz-prompt",
+      "name": "Build: Quiz Prompt"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are a precise quiz generator. Always respond with valid JSON only. No markdown, no extra text.' }, { role: 'user', content: $json.llm_prompt }], temperature: 0.7, max_tokens: 4000, response_format: { type: 'json_object' } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1740, 300],
+      "id": "groq-generate-quiz",
+      "name": "Groq: Generate Quiz",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_GROQ_CREDENTIAL_ID",
+          "name": "Groq API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse Groq response and format quiz\nconst groqResponse = $input.first().json;\nconst quizParams = $('Validate: Quiz Request').first().json;\n\nlet quizData;\ntry {\n  const content = groqResponse.choices[0].message.content;\n  quizData = JSON.parse(content);\n} catch (e) {\n  throw new Error('Failed to parse quiz from LLM: ' + e.message);\n}\n\nreturn [{\n  json: {\n    success: true,\n    quiz: {\n      quiz_id: `quiz_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`,\n      user_id: quizParams.user_id,\n      file_id: quizParams.file_id,\n      difficulty: quizParams.difficulty,\n      num_questions: quizData.questions?.length || 0,\n      questions: quizData.questions || [],\n      generated_at: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1960, 300],
+      "id": "format-quiz-output",
+      "name": "Format: Quiz Output"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2180, 300],
+      "id": "respond-quiz",
+      "name": "Respond: Quiz JSON"
+    },
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "evaluate-quiz",
+        "options": {
+          "responseMode": "responseNode"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 700],
+      "id": "wh-evaluate-quiz",
+      "name": "Webhook: Evaluate Quiz"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate and process quiz evaluation request\nconst body = $input.first().json.body;\n\nif (!body.user_id || !body.questions || !body.user_answers) {\n  throw new Error('Missing required fields: user_id, questions, user_answers');\n}\n\nconst questions = body.questions;\nconst userAnswers = body.user_answers;\n\n// Score the quiz\nlet correct = 0;\nlet incorrect = 0;\nconst results = [];\nconst weakTopics = [];\n\nfor (let i = 0; i < questions.length; i++) {\n  const q = questions[i];\n  const userAnswer = userAnswers[i] || '';\n  const isCorrect = userAnswer.toUpperCase() === q.correct_answer.toUpperCase();\n  \n  if (isCorrect) {\n    correct++;\n  } else {\n    incorrect++;\n    weakTopics.push(q.topic || `Question ${i+1}`);\n  }\n  \n  results.push({\n    question_id: q.id,\n    question: q.question,\n    user_answer: userAnswer,\n    correct_answer: q.correct_answer,\n    is_correct: isCorrect,\n    explanation: q.explanation || '',\n    topic: q.topic || ''\n  });\n}\n\nreturn [{\n  json: {\n    user_id: body.user_id,\n    file_id: body.file_id || null,\n    difficulty: body.difficulty || 'medium',\n    total_questions: questions.length,\n    correct_answers: correct,\n    incorrect_answers: incorrect,\n    score_percentage: Math.round((correct / questions.length) * 100),\n    results: results,\n    weak_topics: [...new Set(weakTopics)],  // deduplicate\n    questions: questions,\n    user_answers: userAnswers\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 700],
+      "id": "score-quiz",
+      "name": "Score: Quiz Answers"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Build gap analysis prompt\nconst scored = $input.first().json;\n\nif (scored.incorrect_answers === 0) {\n  // Perfect score — skip LLM call\n  return [{\n    json: {\n      ...scored,\n      gap_analysis: {\n        summary: 'Excellent! You answered all questions correctly.',\n        knowledge_gaps: [],\n        recommendations: ['Continue with harder difficulty to challenge yourself.'],\n        mastery_level: 'Expert'\n      }\n    }\n  }];\n}\n\nconst wrongAnswers = scored.results\n  .filter(r => !r.is_correct)\n  .map(r => `Q: ${r.question}\\nYour Answer: ${r.user_answer} | Correct: ${r.correct_answer}\\nTopic: ${r.topic}\\nExplanation: ${r.explanation}`)\n  .join('\\n\\n');\n\nconst prompt = `You are a learning analytics expert. Analyze the following incorrect quiz answers and provide a detailed concept gap analysis.\n\nSTUDENT PERFORMANCE:\n- Score: ${scored.correct_answers}/${scored.total_questions} (${scored.score_percentage}%)\n- Difficulty: ${scored.difficulty}\n\nINCORRECT ANSWERS:\n${wrongAnswers}\n\nWEAK TOPICS IDENTIFIED: ${scored.weak_topics.join(', ')}\n\nProvide a JSON response with this structure:\n{\n  \"summary\": \"2-3 sentence overview of the student's understanding gaps\",\n  \"knowledge_gaps\": [\n    {\n      \"topic\": \"Topic name\",\n      \"gap_description\": \"What the student doesn't understand\",\n      \"severity\": \"high/medium/low\",\n      \"prerequisite_concepts\": [\"concepts they should review first\"]\n    }\n  ],\n  \"recommendations\": [\n    \"Specific actionable study recommendations\"\n  ],\n  \"suggested_resources\": [\n    \"Types of resources that would help (e.g., 'Watch a video on X', 'Read chapter about Y')\"\n  ],\n  \"mastery_level\": \"Beginner/Intermediate/Advanced/Expert\",\n  \"next_steps\": \"What difficulty and topics to focus on next\"\n}`;\n\nreturn [{\n  json: {\n    ...scored,\n    needs_gap_analysis: true,\n    gap_prompt: prompt\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [640, 700],
+      "id": "build-gap-prompt",
+      "name": "Build: Gap Analysis Prompt"
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": false },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.needs_gap_analysis }}",
+              "rightValue": true,
+              "operator": { "type": "boolean", "operation": "equals" }
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2,
+      "position": [860, 700],
+      "id": "check-needs-analysis",
+      "name": "IF: Needs Analysis?"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ model: 'llama-3.3-70b-versatile', messages: [{ role: 'system', content: 'You are a learning analytics expert. Respond only with valid JSON.' }, { role: 'user', content: $json.gap_prompt }], temperature: 0.5, max_tokens: 2000, response_format: { type: 'json_object' } }) }}",
+        "options": {
+          "timeout": 60000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1080, 640],
+      "id": "groq-gap-analysis",
+      "name": "Groq: Gap Analysis",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_GROQ_CREDENTIAL_ID",
+          "name": "Groq API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse gap analysis and combine with quiz results\nconst groqResponse = $input.first().json;\nconst quizData = $('Build: Gap Analysis Prompt').first().json;\n\nlet gapAnalysis;\ntry {\n  const content = groqResponse.choices[0].message.content;\n  gapAnalysis = JSON.parse(content);\n} catch (e) {\n  gapAnalysis = {\n    summary: 'Gap analysis could not be parsed. Review incorrect answers manually.',\n    knowledge_gaps: quizData.weak_topics.map(t => ({ topic: t, severity: 'medium' })),\n    recommendations: ['Review the topics you got wrong.'],\n    mastery_level: quizData.score_percentage >= 70 ? 'Intermediate' : 'Beginner'\n  };\n}\n\nreturn [{\n  json: {\n    success: true,\n    evaluation: {\n      user_id: quizData.user_id,\n      file_id: quizData.file_id,\n      score: {\n        correct: quizData.correct_answers,\n        total: quizData.total_questions,\n        percentage: quizData.score_percentage\n      },\n      difficulty: quizData.difficulty,\n      results: quizData.results,\n      gap_analysis: gapAnalysis,\n      evaluated_at: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1300, 640],
+      "id": "format-evaluation",
+      "name": "Format: Evaluation"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=YOUR_SUPABASE_URL/rest/v1/quiz_results",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ user_id: $json.evaluation.user_id, file_id: $json.evaluation.file_id, difficulty: $json.evaluation.difficulty, total_questions: $json.evaluation.score.total, correct_answers: $json.evaluation.score.correct, questions: $json.evaluation.results, answers: $json.evaluation.results.map(r => r.user_answer), gap_analysis: $json.evaluation.gap_analysis }) }}"
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1520, 640],
+      "id": "save-quiz-result",
+      "name": "Save: Quiz Result",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($('Format: Evaluation').first().json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1740, 640],
+      "id": "respond-evaluation",
+      "name": "Respond: Evaluation"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Perfect score — just format the response\nconst data = $input.first().json;\n\nreturn [{\n  json: {\n    success: true,\n    evaluation: {\n      user_id: data.user_id,\n      file_id: data.file_id,\n      score: {\n        correct: data.correct_answers,\n        total: data.total_questions,\n        percentage: data.score_percentage\n      },\n      difficulty: data.difficulty,\n      results: data.results,\n      gap_analysis: data.gap_analysis,\n      evaluated_at: new Date().toISOString()\n    }\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1080, 820],
+      "id": "perfect-score",
+      "name": "Format: Perfect Score"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [1300, 820],
+      "id": "respond-perfect",
+      "name": "Respond: Perfect Score"
+    }
+  ],
+  "connections": {
+    "Webhook: Generate Quiz": {
+      "main": [
+        [
+          {
+            "node": "Validate: Quiz Request",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate: Quiz Request": {
+      "main": [
+        [
+          {
+            "node": "Build: Search Query",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build: Search Query": {
+      "main": [
+        [
+          {
+            "node": "Embed: Query (HF)",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed: Query (HF)": {
+      "main": [
+        [
+          {
+            "node": "Prepare: Vector Search",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare: Vector Search": {
+      "main": [
+        [
+          {
+            "node": "Search: Supabase Vectors",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Search: Supabase Vectors": {
+      "main": [
+        [
+          {
+            "node": "Build: Quiz Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build: Quiz Prompt": {
+      "main": [
+        [
+          {
+            "node": "Groq: Generate Quiz",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: Generate Quiz": {
+      "main": [
+        [
+          {
+            "node": "Format: Quiz Output",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format: Quiz Output": {
+      "main": [
+        [
+          {
+            "node": "Respond: Quiz JSON",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Webhook: Evaluate Quiz": {
+      "main": [
+        [
+          {
+            "node": "Score: Quiz Answers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Score: Quiz Answers": {
+      "main": [
+        [
+          {
+            "node": "Build: Gap Analysis Prompt",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Build: Gap Analysis Prompt": {
+      "main": [
+        [
+          {
+            "node": "IF: Needs Analysis?",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "IF: Needs Analysis?": {
+      "main": [
+        [
+          {
+            "node": "Groq: Gap Analysis",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Format: Perfect Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Groq: Gap Analysis": {
+      "main": [
+        [
+          {
+            "node": "Format: Evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format: Evaluation": {
+      "main": [
+        [
+          {
+            "node": "Save: Quiz Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Save: Quiz Result": {
+      "main": [
+        [
+          {
+            "node": "Respond: Evaluation",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Format: Perfect Score": {
+      "main": [
+        [
+          {
+            "node": "Respond: Perfect Score",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "study-app-quiz-feedback"
+  }
+}

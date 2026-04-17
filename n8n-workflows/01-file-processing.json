@@ -1,0 +1,583 @@
+{
+  "name": "01 — File Processing Pipeline",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "process-file",
+        "options": {
+          "responseMode": "responseNode"
+        }
+      },
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 1.1,
+      "position": [200, 400],
+      "id": "webhook-trigger",
+      "name": "Webhook: Process File"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Validate incoming request\nconst body = $input.first().json.body;\n\nif (!body.user_id || !body.file_type) {\n  throw new Error('Missing required fields: user_id, file_type');\n}\n\nconst fileId = body.file_id || `file_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;\n\nreturn [{\n  json: {\n    user_id: body.user_id,\n    file_id: fileId,\n    file_name: body.file_name || 'Untitled',\n    file_type: body.file_type,       // 'pdf', 'youtube', 'rss', 'web'\n    source_url: body.source_url || '',\n    content: body.content || '',      // pre-extracted text (optional)\n    metadata: body.metadata || {}\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [420, 400],
+      "id": "validate-input",
+      "name": "Validate Input"
+    },
+    {
+      "parameters": {
+        "mode": "rules",
+        "rules": {
+          "values": [
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.file_type }}",
+                    "rightValue": "pdf",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": "PDF"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.file_type }}",
+                    "rightValue": "youtube",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": "YouTube"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.file_type }}",
+                    "rightValue": "rss",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": "RSS"
+            },
+            {
+              "conditions": {
+                "options": { "caseSensitive": false },
+                "conditions": [
+                  {
+                    "leftValue": "={{ $json.file_type }}",
+                    "rightValue": "web",
+                    "operator": { "type": "string", "operation": "equals" }
+                  }
+                ]
+              },
+              "renameOutput": "Web"
+            }
+          ]
+        }
+      },
+      "type": "n8n-nodes-base.switch",
+      "typeVersion": 3,
+      "position": [640, 400],
+      "id": "switch-file-type",
+      "name": "Switch: File Type"
+    },
+    {
+      "parameters": {
+        "jsCode": "// PDF Text Extraction\n// If content was pre-extracted by the frontend, use it directly.\n// Otherwise, attempt to fetch and do basic text extraction.\nconst item = $input.first().json;\n\nlet extractedText = '';\n\nif (item.content && item.content.trim().length > 0) {\n  // Pre-extracted text provided by frontend\n  extractedText = item.content;\n} else if (item.source_url) {\n  // For PDF URLs, we note that full PDF parsing typically\n  // requires a dedicated service. Here we provide a fallback.\n  extractedText = `[PDF content from: ${item.source_url}] — ` +\n    'For production, integrate a PDF parsing service like ' +\n    'pdf-parse, Apache Tika, or use the n8n Extract From File node.';\n} else {\n  throw new Error('No content or source_url provided for PDF processing');\n}\n\nreturn [{\n  json: {\n    ...item,\n    extracted_text: extractedText,\n    extraction_method: 'pdf'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 200],
+      "id": "extract-pdf",
+      "name": "Extract: PDF Text"
+    },
+    {
+      "parameters": {
+        "jsCode": "// YouTube Transcript Extraction via yt-dlp\n// This node prepares the command. The actual execution\n// happens in the next Execute Command node.\nconst item = $input.first().json;\n\nif (!item.source_url) {\n  throw new Error('No YouTube URL provided in source_url');\n}\n\n// Extract video ID from URL\nconst url = item.source_url;\nlet videoId = '';\nif (url.includes('youtu.be/')) {\n  videoId = url.split('youtu.be/')[1].split('?')[0];\n} else if (url.includes('watch?v=')) {\n  videoId = url.split('watch?v=')[1].split('&')[0];\n} else {\n  videoId = url;\n}\n\nreturn [{\n  json: {\n    ...item,\n    video_id: videoId,\n    yt_command: `yt-dlp --write-auto-sub --sub-lang en --skip-download --print-to-file \"%(subtitles.en.-1.ext)s\" - \"${url}\" 2>/dev/null || yt-dlp --write-auto-sub --sub-lang en --skip-download -o - \"${url}\" 2>&1 | grep -v \"^\\[\" | head -500`\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, 400],
+      "id": "prepare-yt",
+      "name": "Prepare: YouTube CMD"
+    },
+    {
+      "parameters": {
+        "command": "={{ $json.yt_command }}"
+      },
+      "type": "n8n-nodes-base.executeCommand",
+      "typeVersion": 1,
+      "position": [1100, 400],
+      "id": "exec-ytdlp",
+      "name": "Execute: yt-dlp"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Process yt-dlp output into clean transcript text\nconst item = $input.first().json;\nconst rawOutput = item.stdout || item.stderr || '';\n\n// Clean yt-dlp subtitle output — remove timestamps and formatting\nlet transcript = rawOutput\n  .split('\\n')\n  .filter(line => {\n    // Skip timestamp lines, empty lines, and yt-dlp info lines\n    return line.trim().length > 0 &&\n      !line.match(/^\\d{2}:\\d{2}/) &&\n      !line.match(/^\\[/) &&\n      !line.includes('-->') &&\n      !line.match(/^<\\/?c>/) &&\n      !line.match(/^WEBVTT/);\n  })\n  .map(line => line.replace(/<[^>]+>/g, '').trim())\n  .filter(line => line.length > 0)\n  .join(' ');\n\n// Deduplicate repeated phrases (common in auto-generated subs)\nconst words = transcript.split(' ');\nconst deduped = [];\nfor (let i = 0; i < words.length; i++) {\n  if (i === 0 || words[i] !== words[i-1]) {\n    deduped.push(words[i]);\n  }\n}\ntranscript = deduped.join(' ');\n\nif (transcript.length < 50) {\n  transcript = 'Transcript extraction failed or video has no captions. Raw output: ' + rawOutput.substring(0, 500);\n}\n\n// Get metadata from the previous prepare node\nconst prevData = $('Prepare: YouTube CMD').first().json;\n\nreturn [{\n  json: {\n    user_id: prevData.user_id,\n    file_id: prevData.file_id,\n    file_name: prevData.file_name,\n    file_type: prevData.file_type,\n    source_url: prevData.source_url,\n    metadata: prevData.metadata,\n    extracted_text: transcript,\n    extraction_method: 'youtube_yt-dlp'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 400],
+      "id": "clean-yt-transcript",
+      "name": "Clean: YT Transcript"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.source_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 600],
+      "id": "fetch-rss",
+      "name": "Fetch: RSS Feed"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Parse RSS/Atom feed content and extract text\nconst item = $input.first().json;\nconst prevData = $('Switch: File Type').first().json;\nconst rawXml = typeof item.data === 'string' ? item.data : JSON.stringify(item);\n\n// Basic RSS/Atom text extraction\nlet articles = [];\n\n// Extract items from RSS\nconst itemMatches = rawXml.match(/<item[^>]*>[\\s\\S]*?<\\/item>/gi) || \n                   rawXml.match(/<entry[^>]*>[\\s\\S]*?<\\/entry>/gi) || [];\n\nfor (const entry of itemMatches) {\n  const titleMatch = entry.match(/<title[^>]*>([\\s\\S]*?)<\\/title>/i);\n  const descMatch = entry.match(/<description[^>]*>([\\s\\S]*?)<\\/description>/i) ||\n                   entry.match(/<content[^>]*>([\\s\\S]*?)<\\/content>/i) ||\n                   entry.match(/<summary[^>]*>([\\s\\S]*?)<\\/summary>/i);\n  \n  const title = titleMatch ? titleMatch[1].replace(/<[^>]+>/g, '').replace(/<!\\[CDATA\\[|\\]\\]>/g, '').trim() : '';\n  const desc = descMatch ? descMatch[1].replace(/<[^>]+>/g, '').replace(/<!\\[CDATA\\[|\\]\\]>/g, '').trim() : '';\n  \n  if (title || desc) {\n    articles.push(`## ${title}\\n${desc}`);\n  }\n}\n\nconst extractedText = articles.length > 0 \n  ? articles.join('\\n\\n---\\n\\n') \n  : rawXml.replace(/<[^>]+>/g, ' ').replace(/\\s+/g, ' ').trim().substring(0, 10000);\n\nreturn [{\n  json: {\n    user_id: prevData.user_id,\n    file_id: prevData.file_id,\n    file_name: prevData.file_name,\n    file_type: prevData.file_type,\n    source_url: prevData.source_url,\n    metadata: { ...prevData.metadata, article_count: articles.length },\n    extracted_text: extractedText,\n    extraction_method: 'rss_feed'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 600],
+      "id": "parse-rss",
+      "name": "Parse: RSS Content"
+    },
+    {
+      "parameters": {
+        "url": "={{ $json.source_url }}",
+        "options": {
+          "response": {
+            "response": {
+              "responseFormat": "text"
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [880, 800],
+      "id": "fetch-web",
+      "name": "Fetch: Web Page"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract readable text from HTML web page\nconst item = $input.first().json;\nconst prevData = $('Switch: File Type').first().json;\nconst html = typeof item.data === 'string' ? item.data : JSON.stringify(item);\n\n// Remove script, style, nav, footer, header tags\nlet text = html\n  .replace(/<script[^>]*>[\\s\\S]*?<\\/script>/gi, '')\n  .replace(/<style[^>]*>[\\s\\S]*?<\\/style>/gi, '')\n  .replace(/<nav[^>]*>[\\s\\S]*?<\\/nav>/gi, '')\n  .replace(/<footer[^>]*>[\\s\\S]*?<\\/footer>/gi, '')\n  .replace(/<header[^>]*>[\\s\\S]*?<\\/header>/gi, '')\n  .replace(/<aside[^>]*>[\\s\\S]*?<\\/aside>/gi, '');\n\n// Convert block elements to newlines\ntext = text\n  .replace(/<\\/?(p|div|br|h[1-6]|li|tr|td|th|blockquote|pre)[^>]*>/gi, '\\n')\n  .replace(/<[^>]+>/g, ' ')               // Remove remaining tags\n  .replace(/&nbsp;/g, ' ')                // Fix entities\n  .replace(/&amp;/g, '&')\n  .replace(/&lt;/g, '<')\n  .replace(/&gt;/g, '>')\n  .replace(/&quot;/g, '\"')\n  .replace(/&#39;/g, \"'\")\n  .replace(/\\s+/g, ' ')                   // Collapse whitespace\n  .trim();\n\n// Get the meaningful content (skip very short results)\nif (text.length < 100) {\n  text = 'Web content extraction returned minimal text. The page may require JavaScript rendering.';\n}\n\nreturn [{\n  json: {\n    user_id: prevData.user_id,\n    file_id: prevData.file_id,\n    file_name: prevData.file_name,\n    file_type: prevData.file_type,\n    source_url: prevData.source_url,\n    metadata: prevData.metadata,\n    extracted_text: text.substring(0, 50000),  // Cap at 50k chars\n    extraction_method: 'web_scrape'\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1100, 800],
+      "id": "parse-web",
+      "name": "Parse: Web Content"
+    },
+    {
+      "parameters": {
+        "mode": "append"
+      },
+      "type": "n8n-nodes-base.merge",
+      "typeVersion": 3,
+      "position": [1560, 400],
+      "id": "merge-extracted",
+      "name": "Merge: All Sources"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Chunk text with overlap for embedding\nconst item = $input.first().json;\nconst text = item.extracted_text || '';\nconst CHUNK_SIZE = 800;       // ~800 chars per chunk\nconst CHUNK_OVERLAP = 150;    // 150 char overlap for context\n\nif (text.length === 0) {\n  throw new Error('No text to chunk');\n}\n\nconst chunks = [];\nlet currentIndex = 0;\n\nwhile (currentIndex < text.length) {\n  let endIndex = currentIndex + CHUNK_SIZE;\n  \n  // Find word boundary\n  if (endIndex < text.length) {\n    const lastSpace = text.lastIndexOf(' ', endIndex);\n    if (lastSpace > currentIndex) {\n      endIndex = lastSpace;\n    }\n  } else {\n    endIndex = text.length;\n  }\n  \n  const chunkContent = text.slice(currentIndex, endIndex).trim();\n  \n  if (chunkContent.length > 20) {  // Skip tiny chunks\n    chunks.push({\n      json: {\n        user_id: item.user_id,\n        file_id: item.file_id,\n        file_name: item.file_name,\n        file_type: item.file_type,\n        chunk_index: chunks.length,\n        content: chunkContent,\n        metadata: {\n          ...item.metadata,\n          extraction_method: item.extraction_method,\n          source_url: item.source_url || null,\n          total_chars: text.length,\n          chunk_start: currentIndex,\n          chunk_end: endIndex\n        }\n      }\n    });\n  }\n  \n  currentIndex = endIndex - CHUNK_OVERLAP;\n  if (currentIndex <= (endIndex - CHUNK_SIZE)) {\n    currentIndex = endIndex;\n  }\n}\n\nconsole.log(`Created ${chunks.length} chunks from ${text.length} characters`);\nreturn chunks;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1780, 400],
+      "id": "chunk-text",
+      "name": "Chunk: Split Text"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api-inference.huggingface.co/pipeline/feature-extraction/sentence-transformers/all-MiniLM-L6-v2",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ inputs: $json.content, options: { wait_for_model: true } }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 5,
+              "batchInterval": 1000
+            }
+          },
+          "timeout": 30000
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2000, 400],
+      "id": "embed-chunks",
+      "name": "Embed: HuggingFace",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_HF_CREDENTIAL_ID",
+          "name": "HuggingFace API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Prepare data for Supabase insertion\nconst items = $input.all();\nconst results = [];\n\nfor (const item of items) {\n  const embedding = item.json.data || item.json;\n  \n  // The HuggingFace feature-extraction endpoint returns\n  // the embedding as a nested array. We need the first element.\n  let embeddingVector;\n  if (Array.isArray(embedding) && Array.isArray(embedding[0])) {\n    embeddingVector = embedding[0]; // sentence-level embedding\n  } else if (Array.isArray(embedding)) {\n    embeddingVector = embedding;\n  } else {\n    throw new Error('Unexpected embedding format: ' + JSON.stringify(embedding).substring(0, 200));\n  }\n  \n  // Get the original chunk data from the Chunk node\n  // We use the item index to match\n  const chunkData = $('Chunk: Split Text').all();\n  const idx = items.indexOf(item);\n  const chunk = chunkData[idx]?.json || {};\n  \n  results.push({\n    json: {\n      user_id: chunk.user_id,\n      file_id: chunk.file_id,\n      file_name: chunk.file_name,\n      file_type: chunk.file_type,\n      chunk_index: chunk.chunk_index,\n      content: chunk.content,\n      metadata: chunk.metadata || {},\n      embedding: `[${embeddingVector.join(',')}]`  // pgvector format\n    }\n  });\n}\n\nreturn results;"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2220, 400],
+      "id": "prepare-store",
+      "name": "Prepare: Store Data"
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=YOUR_SUPABASE_URL/rest/v1/documents",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendHeaders": true,
+        "headerParameters": {
+          "parameters": [
+            {
+              "name": "Content-Type",
+              "value": "application/json"
+            },
+            {
+              "name": "Prefer",
+              "value": "return=representation"
+            }
+          ]
+        },
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ user_id: $json.user_id, file_id: $json.file_id, file_name: $json.file_name, file_type: $json.file_type, chunk_index: $json.chunk_index, content: $json.content, metadata: $json.metadata, embedding: $json.embedding }) }}",
+        "options": {
+          "batching": {
+            "batch": {
+              "batchSize": 10,
+              "batchInterval": 500
+            }
+          }
+        }
+      },
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [2440, 400],
+      "id": "store-supabase",
+      "name": "Store: Supabase",
+      "credentials": {
+        "httpHeaderAuth": {
+          "id": "REPLACE_WITH_SUPABASE_CREDENTIAL_ID",
+          "name": "Supabase API"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "jsCode": "// Summarize results\nconst stored = $input.all();\nconst firstChunk = $('Chunk: Split Text').first().json;\n\nreturn [{\n  json: {\n    success: true,\n    message: `Successfully processed and stored ${stored.length} chunks`,\n    file_id: firstChunk.file_id,\n    file_name: firstChunk.file_name,\n    file_type: firstChunk.file_type,\n    chunks_stored: stored.length,\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 400],
+      "id": "summarize-result",
+      "name": "Summarize Result"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2880, 400],
+      "id": "respond-webhook",
+      "name": "Respond: Success"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Error handler — catch and format errors\nconst error = $input.first().json;\n\nreturn [{\n  json: {\n    success: false,\n    error: error.message || 'An unknown error occurred during file processing',\n    timestamp: new Date().toISOString()\n  }\n}];"
+      },
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [2660, 650],
+      "id": "error-handler",
+      "name": "Error Handler"
+    },
+    {
+      "parameters": {
+        "respondWith": "json",
+        "responseBody": "={{ JSON.stringify($json) }}",
+        "options": {
+          "responseCode": "500",
+          "responseHeaders": {
+            "entries": [
+              {
+                "name": "Access-Control-Allow-Origin",
+                "value": "*"
+              }
+            ]
+          }
+        }
+      },
+      "type": "n8n-nodes-base.respondToWebhook",
+      "typeVersion": 1.1,
+      "position": [2880, 650],
+      "id": "respond-error",
+      "name": "Respond: Error"
+    }
+  ],
+  "connections": {
+    "Webhook: Process File": {
+      "main": [
+        [
+          {
+            "node": "Validate Input",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Validate Input": {
+      "main": [
+        [
+          {
+            "node": "Switch: File Type",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Switch: File Type": {
+      "main": [
+        [
+          {
+            "node": "Extract: PDF Text",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Prepare: YouTube CMD",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch: RSS Feed",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        [
+          {
+            "node": "Fetch: Web Page",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract: PDF Text": {
+      "main": [
+        [
+          {
+            "node": "Merge: All Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare: YouTube CMD": {
+      "main": [
+        [
+          {
+            "node": "Execute: yt-dlp",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Execute: yt-dlp": {
+      "main": [
+        [
+          {
+            "node": "Clean: YT Transcript",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Clean: YT Transcript": {
+      "main": [
+        [
+          {
+            "node": "Merge: All Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch: RSS Feed": {
+      "main": [
+        [
+          {
+            "node": "Parse: RSS Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse: RSS Content": {
+      "main": [
+        [
+          {
+            "node": "Merge: All Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Fetch: Web Page": {
+      "main": [
+        [
+          {
+            "node": "Parse: Web Content",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Parse: Web Content": {
+      "main": [
+        [
+          {
+            "node": "Merge: All Sources",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Merge: All Sources": {
+      "main": [
+        [
+          {
+            "node": "Chunk: Split Text",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Chunk: Split Text": {
+      "main": [
+        [
+          {
+            "node": "Embed: HuggingFace",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Embed: HuggingFace": {
+      "main": [
+        [
+          {
+            "node": "Prepare: Store Data",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Prepare: Store Data": {
+      "main": [
+        [
+          {
+            "node": "Store: Supabase",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Store: Supabase": {
+      "main": [
+        [
+          {
+            "node": "Summarize Result",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Summarize Result": {
+      "main": [
+        [
+          {
+            "node": "Respond: Success",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Error Handler": {
+      "main": [
+        [
+          {
+            "node": "Respond: Error",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "meta": {
+    "instanceId": "study-app-file-processing"
+  }
+}
